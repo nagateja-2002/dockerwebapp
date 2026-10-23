@@ -1,0 +1,72 @@
+name: Docker Web App CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-scan-build-smoke:
+    name: Test, scan, build, and smoke-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile Python source
+        run: python -m compileall -q app tests
+
+      - name: Scan filesystem with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Build Docker image
+        run: docker build --tag dockerwebapp:ci .
+
+      - name: Smoke-test running container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name dockerwebapp-ci --publish 127.0.0.1:18080:8080 dockerwebapp:ci
+          cleanup() {
+            docker rm --force dockerwebapp-ci >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          healthy=false
+          for _ in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:18080/health > /tmp/dockerwebapp-health.json; then
+              healthy=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [[ "$healthy" != "true" ]]; then
+            docker logs dockerwebapp-ci
+            echo "Health endpoint did not become ready." >&2
+            exit 1
+          fi
+
+          python -c 'import json; d=json.load(open("/tmp/dockerwebapp-health.json")); assert d == {"status": "UP", "service": "dockerwebapp"}, d'
+          curl --fail --silent http://127.0.0.1:18080/ | grep --fixed-strings --quiet "Dockerized Web App"
+          docker inspect --format '{{.Config.User}}' dockerwebapp-ci | grep --fixed-strings --quiet "10001:10001"
